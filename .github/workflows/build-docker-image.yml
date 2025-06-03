@@ -2,11 +2,8 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'v2_5/**'
+    branches: [main, master]
+    paths: ['v2_5/**']
   workflow_dispatch:
 
 env:
@@ -21,38 +18,79 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    # 1 ▸ checkout --------------------------------------------------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    # 2 ▸ **inline disk-cleanup** ------------------------------------------------------
+    # Reclaims ≈ 25-30 GB on the ubuntu-latest runner
+    - name: Free disk space for large Docker build
+      shell: bash
+      run: |
+        set -euxo pipefail
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
+        echo "Disk space before clean-up:"
+        df -h /
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        # Remove Android, .NET, Haskell tool-chains that come pre-installed
+        sudo rm -rf /usr/local/lib/android \
+                    /usr/share/dotnet \
+                    /opt/ghc /usr/local/.ghcup || true
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./v2_5
-          file: ./v2_5/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+        # Remove large packages we never need for a Docker build
+        sudo apt-get remove -y '^aspnetcore-.*' '^dotnet-.*' '^llvm-.*' 'php.*' \
+                              '^mongodb-.*' '^mysql-.*' google-cloud-sdk google-cloud-cli \
+                              azure-cli google-chrome-stable firefox powershell mono-devel \
+                              libgl1-mesa-dri || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+
+        # Wipe the tool-cache (pre-downloaded SDKs, about 6–7 GB)
+        sudo rm -rf /opt/hostedtoolcache || true
+
+        # Drop any docker images from previous jobs (usually none, but cheap insurance)
+        sudo docker image prune --all --force || true
+
+        # Delete the 4-GB swapfile
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile || true
+
+        echo "Disk space after clean-up:"
+        df -h /
+
+    # 3 ▸ login to GHCR ---------------------------------------------------------------
+    - name: Log in to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    # 4 ▸ metadata for tags/labels ----------------------------------------------------
+    - name: Extract image metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    # 5 ▸ buildx builder --------------------------------------------------------------
+    - name: Set up Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # 6 ▸ build & push (layers streamed straight to GHCR) -----------------------------
+    - name: Build & push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./v2_5
+        file: ./v2_5/Dockerfile
+        push: true          # stream layers instead of keeping the final image locally
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to:   type=gha,mode=max
+        platforms: linux/amd64
