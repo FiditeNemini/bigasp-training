@@ -86,14 +86,16 @@ def train(config: DictConfig) -> None:
 	
 	# Build streaming datasets
 	micro_batch_size = config.trainer.device_train_microbatch_size
+	test_batch_size = len(test_streams) * micro_batch_size   # TODO: Bit hacky, len(test_dataset) gets modified by num_canonical_nodes
+	stable_batch_size = len(stable_train_streams) * micro_batch_size
 	train_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=train_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.train_dataset.streaming_kwargs)
 	test_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=test_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
 	stable_train_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=stable_train_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
 
 	# Build straming dataloaders
 	train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.train_batch_size // dist.get_world_size(), dataset=train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.train_dataset.dataloader_kwargs)
-	test_dataloader = CustomStreamingDataLoader(device_batch_size=len(test_dataset) // dist.get_world_size(), dataset=test_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
-	stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=len(stable_train_dataset) // dist.get_world_size(), dataset=stable_train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
+	test_dataloader = CustomStreamingDataLoader(device_batch_size=test_batch_size // dist.get_world_size(), dataset=test_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
+	stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=stable_batch_size // dist.get_world_size(), dataset=stable_train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
 
 	# Wrap in DataSpec to override the split_batch method
 	train_dataloader = DataSpec(train_dataloader, split_batch=CustomStreamingDataLoader.split_batch, get_num_samples_in_batch=CustomStreamingDataLoader.get_num_samples_in_batch)
