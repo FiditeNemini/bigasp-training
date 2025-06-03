@@ -6,7 +6,7 @@ on:
       - main
       - master
     paths:
-      - 'bigasp-training/v2_5/**'
+      - 'v2_5/**'
   workflow_dispatch:
 
 env:
@@ -48,8 +48,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./bigasp-training/v2_5
-          file: ./bigasp-training/v2_5/Dockerfile
+          context: ./v2_5
+          file: ./v2_5/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
