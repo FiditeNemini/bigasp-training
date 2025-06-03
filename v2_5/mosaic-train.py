@@ -1,31 +1,43 @@
-from composer import ComposerModel, Trainer, Callback, Algorithm, Evaluator, State, Logger, DataSpec
-from composer.utils import dist, reproducibility
-import torch
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPTextModelWithProjection, PreTrainedTokenizer
-from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+import logging
+import operator
+import random
 import time
-from composer.devices import DeviceGPU
-import torch.nn.functional as F
-from diffusers.training_utils import compute_density_for_timestep_sampling
+from pathlib import Path
+from typing import Any, Sequence
+
 import composer.loggers.wandb_logger
-from omegaconf import DictConfig, OmegaConf
 import hydra
+import torch
+import torch.nn.functional as F
+import wandb.sdk.lib.runid
+from composer import (
+	Algorithm,
+	Callback,
+	ComposerModel,
+	DataSpec,
+	Evaluator,
+	Logger,
+	State,
+	Trainer,
+)
 from composer.algorithms.low_precision_groupnorm import apply_low_precision_groupnorm
 from composer.algorithms.low_precision_layernorm import apply_low_precision_layernorm
 from composer.core import Precision
-import operator
-from streaming import StreamingDataset, Stream, StreamingDataLoader
-import random
-from pathlib import Path
-from typing import Sequence, Any
+from composer.devices import DeviceGPU
+from composer.loggers import LoggerDestination
+from composer.utils import dist, reproducibility
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
+	FlowMatchEulerDiscreteScheduler,
+)
+from diffusers.training_utils import compute_density_for_timestep_sampling
+from omegaconf import DictConfig, OmegaConf
+from streaming import Stream, StreamingDataLoader, StreamingDataset
 from torchmetrics import MeanSquaredError
-import wandb.sdk.lib.runid
-import logging
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
 
 
-
-# TODO: GradScaler (make sure it's also logged), my default was 2**16, which I think is the normal default
 # TODO: Is the index passed to the dataset monotonic? No.  If I want fully deterministic training I'll need to find some way to factor in the epoch in the datasets.
 # NOTE: Autoresume is enabled. If it's disabled, manual resuming can be done using load_path on the Trainer's config in the config yaml.
 
@@ -115,6 +127,7 @@ def train(config: DictConfig) -> None:
 	# Build list of loggers, callbacks, and algorithms to pass to trainer
 	callbacks: list[Callback] = []
 	algorithms: list[Algorithm] = []
+	loggers: list[LoggerDestination] = []
 
 	run_id = config.get('run_id', wandb.sdk.lib.runid.generate_id())
 	container = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
@@ -122,6 +135,10 @@ def train(config: DictConfig) -> None:
 		project=config.logger.wandb.project,
 		init_kwargs={'config': container, 'id': run_id},
 	)
+	loggers.append(wandb_logger)
+	loggers.append(composer.loggers.FileLogger(
+		filename="logs/{run_name}/logs-rank{rank}.txt",
+	))
 
 	if 'algorithms' in config:
 		for ag_name, ag_conf in config.algorithms.items():
@@ -162,7 +179,7 @@ def train(config: DictConfig) -> None:
 		eval_dataloader=eval_set,
 		optimizers=optimizer,
 		model=model,
-		loggers=[wandb_logger],
+		loggers=loggers,
 		algorithms=algorithms,
 		schedulers=scheduler,
 		callbacks=callbacks,
@@ -645,8 +662,9 @@ def s3_list_directories(remote_path: str) -> list[str]:
 	Return each immediate sub-directory as a fully-qualified S3/R2 URI
 	like  's3://my-bucket/photos/2025/01/'.
 	"""
-	from urllib.parse import urlparse
 	import os
+	from urllib.parse import urlparse
+
 	import boto3
 	from botocore.config import Config
 

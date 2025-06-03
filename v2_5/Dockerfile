@@ -23,4 +23,4 @@ ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
     CMD python -c "import torch; print(torch.cuda.is_available())" || exit 1
 
-CMD ["composer", "mosaic-train.py", "--config-path", "./", "--config-name", "mosaic-config.yaml"]
+CMD ["composer", "mosaic-train.py"]
