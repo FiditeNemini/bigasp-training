@@ -631,7 +631,8 @@ def build_streams(remote: str, split: str, local: str) -> list[Stream]:
 		stream_name = stream_path.split('/')[-1] if not stream_path.endswith('/') else stream_path.split('/')[-2]
 		print(f"Building stream for {stream_path} in split {split}, caching to {local_path} as {stream_name}")
 
-		stream = Stream(remote=stream_path, local=str(local_path / stream_name), download_retry=7, download_timeout=60, validate_hash="xxh3_128") 
+		#stream = Stream(remote=stream_path, local=str(local_path / stream_name), download_retry=7, download_timeout=60, validate_hash="xxh3_128")
+		stream = Stream(remote=stream_path, local=str(local_path / stream_name), validate_hash="xxh3_128")
 		streams.append(stream)
 	
 	return streams
@@ -780,7 +781,7 @@ class StreamingWarningFilter(logging.Filter):
 		streaming_logger.addFilter(StreamingWarningFilter())
 
 
-@hydra.main(version_base=None)
+@hydra.main(version_base=None, config_path=".", config_name="mosaic-config")
 def main(config: DictConfig) -> None:
     """Hydra wrapper for train."""
     if not config:
