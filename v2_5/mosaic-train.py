@@ -1,15 +1,16 @@
+from collections.abc import Mapping, Sequence
 import logging
 import operator
 import random
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
+import os
 
 import composer.loggers.wandb_logger
 import hydra
 import torch
 import torch.nn.functional as F
-import wandb.sdk.lib.runid
 from composer import (
 	Algorithm,
 	Callback,
@@ -32,10 +33,14 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.training_utils import compute_density_for_timestep_sampling
 from omegaconf import DictConfig, OmegaConf
-from streaming import Stream, StreamingDataLoader, StreamingDataset
+#from streaming import Stream, StreamingDataLoader, StreamingDataset
+from flowrider import StreamingDataset, StreamingDataLoader
+from flowrider import Config as StreamingConfig
 from torchmetrics import MeanSquaredError
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
+from composer.utils import get_device
+import shutil
 
 
 # TODO: Is the index passed to the dataset monotonic? No.  If I want fully deterministic training I'll need to find some way to factor in the epoch in the datasets.
@@ -49,19 +54,39 @@ IMPORTANT_TAGS = set(['watermark', 'worst quality', 'low quality', 'normal quali
 
 
 def train(config: DictConfig) -> None:
+	torch.set_float32_matmul_precision("high")
+
+	try:
+		total, used, free = shutil.disk_usage('/dev/shm')
+		print(f"Shared memory space: {free / 1024**3:.2f} GB free, {used / 1024**3:.2f} GB used, {total / 1024**3:.2f} GB total")
+	except OSError as e:
+		print(f"Failed to check shared memory space: {e}")
+
+	dist.initialize_dist(get_device(None), 300.0)
+
 	reproducibility.seed_all(config['seed'])
 
+	print(f"DEBUG: LOCAL_RANK: {dist.get_local_rank()}/{os.environ.get('LOCAL_RANK', 'N/A')}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}")
+
 	# Filter out dumb warnings
-	StreamingWarningFilter.setup()
+	#StreamingWarningFilter.setup()
 
 	# Build model
 	model = stable_diffusion_xl(base_model=config.model.base_model, base_revision=config.model.base_revision, base_variant=config.model.base_variant, train_text_encoder=config.model.train_text_encoder)
+	#model.unet.enable_xformers_memory_efficient_attention()
 	if config.model.gradient_checkpointing:
 			model.unet.enable_gradient_checkpointing()
 	
 	# Compile
 	# I cannot for the life of me get this to work with SDXL
-	#model = torch.compile(model, dynamic=True)#, mode='reduce-overhead', fullgraph=False)  # type: ignore
+	# The second compile command does work. Either I try it as is, and it fails because expandable_segments is on
+	# or I use max-autotune-no-cudagraph and the result in a slower training speed
+	#torch._inductor.config.conv_1x1_as_mm = True
+	#torch._inductor.config.coordinate_descent_tuning = True
+	#torch._inductor.config.epilogue_fusion = False
+	#torch._inductor.config.coordinate_descent_check_all_directions = True
+	#model.unet = torch.compile(model.unet, dynamic=True, mode='reduce-overhead', fullgraph=False)#, mode='reduce-overhead', fullgraph=False)  # type: ignore
+	# model.unet = torch.compile(model.unet, mode='max-autotune', dynamic=True, fullgraph=False)  # type: ignore
 
 	# Build optimizer
 	optimizer_cls = torch.optim.AdamW
@@ -70,6 +95,7 @@ def train(config: DictConfig) -> None:
 		'betas': (config.optimizer.adam_beta1, config.optimizer.adam_beta2),
 		'eps': config.optimizer.adam_eps,
 		'weight_decay': config.optimizer.weight_decay,
+		'fused': config.optimizer.fused if 'fused' in config.optimizer else False,
 	}
 
 	base_lr = config.optimizer.lr
@@ -89,34 +115,66 @@ def train(config: DictConfig) -> None:
 	train_streams = build_streams(remote=config.dataset.remote, split='train', local=config.dataset.local)
 	if len(train_streams) == 0:
 		raise ValueError(f"No training streams found in {config.dataset.remote} for split 'train'")
+	
 	test_streams = build_streams(remote=config.dataset.remote, split='test', local=config.dataset.local)
 	if len(test_streams) == 0:
 		raise ValueError(f"No test streams found in {config.dataset.remote} for split 'test'")
+	
 	stable_train_streams = build_streams(remote=config.dataset.remote, split='stable-train', local=config.dataset.local)
 	if len(stable_train_streams) == 0:
 		raise ValueError(f"No stable training streams found in {config.dataset.remote} for split 'stable-train'")
 	
 	# Build streaming datasets
+	print("Building streaming datasets...")
+	flowrider_config = StreamingConfig(cache_dir=config.dataset.cache_dir, cache_limit=config.dataset.cache_limit, max_downloads=config.dataset.max_downloads, readahead=config.dataset.readahead, num_cache_workers=config.dataset.num_cache_workers, trace_path="flowrider-trace.log")
 	micro_batch_size = config.trainer.device_train_microbatch_size
-	test_batch_size = len(test_streams) * micro_batch_size   # TODO: Bit hacky, len(test_dataset) gets modified by num_canonical_nodes
-	stable_batch_size = len(stable_train_streams) * micro_batch_size
-	train_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=train_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.train_dataset.streaming_kwargs)
-	test_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=test_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
-	stable_train_dataset = StreamingImageCaptionDataset(tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=stable_train_streams, batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
+	#test_batch_size = len(test_streams) * micro_batch_size   # TODO: Bit hacky, len(test_dataset) gets modified by num_canonical_nodes
+	#stable_batch_size = len(stable_train_streams) * micro_batch_size
+	train_dataset = StreamingImageCaptionDataset(streaming_config=flowrider_config, tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=train_streams, micro_batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.train_dataset.streaming_kwargs)
+	print(f"Train dataset has {len(train_dataset)}")
+	test_dataset = StreamingImageCaptionDataset(streaming_config=flowrider_config, tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=test_streams, micro_batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
+	print(f"Test dataset has {len(test_dataset)}")
+	stable_train_dataset = StreamingImageCaptionDataset(streaming_config=flowrider_config, tokenizer=model.tokenizer, tokenizer_2=model.tokenizer_2, streams=stable_train_streams, micro_batch_size=micro_batch_size, tag_prob=config.dataset.tag_prob, **config.dataset.test_dataset.streaming_kwargs)
+	print(f"Stable train dataset has {len(stable_train_dataset)}")
 
 	# Build straming dataloaders
-	train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.train_batch_size // dist.get_world_size(), dataset=train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.train_dataset.dataloader_kwargs)
-	test_dataloader = CustomStreamingDataLoader(device_batch_size=test_batch_size // dist.get_world_size(), dataset=test_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
-	stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=stable_batch_size // dist.get_world_size(), dataset=stable_train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
+	print("Building streaming dataloaders...")
+	train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.train_batch_size // dist.get_world_size(), dataset=train_dataset, **config.dataset.train_dataset.dataloader_kwargs)
+	test_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.test_batch_size // dist.get_world_size(), dataset=test_dataset, **config.dataset.test_dataset.dataloader_kwargs)
+	stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.test_batch_size // dist.get_world_size(), dataset=stable_train_dataset, **config.dataset.test_dataset.dataloader_kwargs)
+
+	# train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.train_batch_size // dist.get_world_size(), dataset=train_dataset, batch_size=micro_batch_size, sampler=None, **{**config.dataset.train_dataset.dataloader_kwargs, 'persistent_workers': False})
+	# test_dataloader = CustomStreamingDataLoader(device_batch_size=test_batch_size // dist.get_world_size(), dataset=test_dataset, batch_size=micro_batch_size, sampler=None, **{**config.dataset.test_dataset.dataloader_kwargs, 'persistent_workers': False})
+	# stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=stable_batch_size // dist.get_world_size(), dataset=stable_train_dataset, batch_size=micro_batch_size, sampler=None, **{**config.dataset.test_dataset.dataloader_kwargs, 'persistent_workers': False})
+
+	# # Warm up the dataloaders
+	# print("Warming up test dataloader...")
+	# next(iter(test_dataloader))
+	# del test_dataloader
+	# print("Warming up stable train dataloader...")
+	# next(iter(stable_train_dataloader))
+	# del stable_train_dataloader
+	# print("Warming up train dataloader...")
+	# next(iter(train_dataloader))
+	# del train_dataloader
+
+	# Recreate the dataloaders, since Composer wants them fresh
+	# Build straming dataloaders
+	#print("Building streaming dataloaders again...")
+	#train_dataloader = CustomStreamingDataLoader(device_batch_size=config.dataset.train_batch_size // dist.get_world_size(), dataset=train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.train_dataset.dataloader_kwargs)
+	#test_dataloader = CustomStreamingDataLoader(device_batch_size=test_batch_size // dist.get_world_size(), dataset=test_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
+	#stable_train_dataloader = CustomStreamingDataLoader(device_batch_size=stable_batch_size // dist.get_world_size(), dataset=stable_train_dataset, batch_size=micro_batch_size, sampler=None, **config.dataset.test_dataset.dataloader_kwargs)
 
 	# Wrap in DataSpec to override the split_batch method
+	print("Wrapping dataloaders in DataSpec...")
 	train_dataloader = DataSpec(train_dataloader, split_batch=CustomStreamingDataLoader.split_batch, get_num_samples_in_batch=CustomStreamingDataLoader.get_num_samples_in_batch)
 	test_dataloader = DataSpec(test_dataloader, split_batch=CustomStreamingDataLoader.split_batch, get_num_samples_in_batch=CustomStreamingDataLoader.get_num_samples_in_batch)
 	stable_train_dataloader = DataSpec(stable_train_dataloader, split_batch=CustomStreamingDataLoader.split_batch, get_num_samples_in_batch=CustomStreamingDataLoader.get_num_samples_in_batch)
 
 	# Need to sleep for a bit to avoid dataloader crash
 	# This is from MosaicML's diffusion repo, so I assume it is needed
-	time.sleep(10)
+	#print("Sleeping for 10 seconds to avoid dataloader crash...")
+	#time.sleep(10)
 
 	# Evaluators
 	eval_set = [
@@ -124,21 +182,41 @@ def train(config: DictConfig) -> None:
 		Evaluator(label='stable_train_loss', dataloader=stable_train_dataloader, metric_names=['MeanSquaredError'])
 	]
 
+	# Get run name
+	os.environ['WANDB_RUN_ID'] = config.run_id
+
 	# Build list of loggers, callbacks, and algorithms to pass to trainer
 	callbacks: list[Callback] = []
 	algorithms: list[Algorithm] = []
 	loggers: list[LoggerDestination] = []
 
-	run_id = config.get('run_id', wandb.sdk.lib.runid.generate_id())
-	container = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
-	wandb_logger = composer.loggers.wandb_logger.WandBLogger(
-		project=config.logger.wandb.project,
-		init_kwargs={'config': container, 'id': run_id},
-	)
-	loggers.append(wandb_logger)
-	loggers.append(composer.loggers.FileLogger(
-		filename="logs/{run_name}/logs-rank{rank}.txt",
-	))
+	if 'logger' in config:
+		for log, log_conf in config.logger.items():
+			if '_target_' in log_conf:
+				print(f'Instantiating logger <{log_conf._target_}>')
+				if log == 'wandb':
+					container = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
+					wandb_logger = hydra.utils.instantiate(log_conf, _partial_=True)
+					loggers.append(wandb_logger(init_kwargs={'config': container}))
+				else:
+					loggers.append(hydra.utils.instantiate(log_conf))
+			else:
+				print(f'Logger <{log}> does not have a _target_ field, skipping instantiation.')
+
+	#container = OmegaConf.to_container(config, resolve=True, throw_on_missing=True)
+	#wandb_logger = composer.loggers.wandb_logger.WandBLogger(
+	#	project=config.logger.wandb.project,
+	#	init_kwargs={'config': container},
+	#)
+	#loggers.append(wandb_logger)
+	# loggers.append(composer.loggers.FileLogger(
+	# 	filename="logs/{run_name}/logs-rank{rank}.txt",
+	# 	remote_file_name="s3://big-asp-v2-5-checkpoints/logs/{run_name}/logs-rank{rank}.txt",
+	# 	flush_interval=50,
+	# ))
+	# loggers.append(composer.loggers.RemoteUploaderDownloader(
+	# 	bucket_uri="s3://big-asp-v2-5-checkpoints",
+	# ))
 
 	if 'algorithms' in config:
 		for ag_name, ag_conf in config.algorithms.items():
@@ -172,9 +250,15 @@ def train(config: DictConfig) -> None:
 
 	scheduler = hydra.utils.instantiate(config.scheduler)
 
+	#prof = composer.profiler.Profiler(
+	#	schedule = composer.profiler.cyclic_schedule(wait=0, warmup=1, active=5, repeat=1),
+	#	trace_handlers = [composer.profiler.JSONTraceHandler(folder="traces")],
+	#)
+
+	print("Initializing Trainer...")
 	trainer: Trainer = hydra.utils.instantiate(
 		config.trainer,
-		run_name=run_id,
+		run_name=config.run_id,
 		train_dataloader=train_dataloader,
 		eval_dataloader=eval_set,
 		optimizers=optimizer,
@@ -183,7 +267,10 @@ def train(config: DictConfig) -> None:
 		algorithms=algorithms,
 		schedulers=scheduler,
 		callbacks=callbacks,
+		#profiler=prof,
 	)
+
+	logging.info(f"Trainer initialized. GPU is {dist.get_world_size()}x{dist.get_local_rank()} on {get_device(None)}")
 
 	print(trainer.state.model)
 
@@ -193,7 +280,9 @@ def train(config: DictConfig) -> None:
 
 	def eval_and_then_train():
 		if config.get('eval_first', True):
+			print("Running evaluation before training...")
 			trainer.eval()
+		print("Starting training...")
 		trainer.fit()
 
 	return eval_and_then_train()
@@ -209,8 +298,8 @@ def stable_diffusion_xl(
 ) -> "StableDiffusion":
 	metrics = [MeanSquaredError()]
 
-	tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer", revision=base_revision, use_fast=False)
-	tokenizer_2 = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer_2", revision=base_revision, use_fast=False)
+	tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer", revision=base_revision, use_fast=True)
+	tokenizer_2 = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer_2", revision=base_revision, use_fast=True)
 
 	text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", revision=base_revision, torch_dtype=torch.float32, variant=base_variant, use_safetensors=True)
 	text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(base_model, subfolder="text_encoder_2", revision=base_revision, torch_dtype=torch.float32, variant=base_variant, use_safetensors=True)
@@ -416,7 +505,21 @@ class StableDiffusion(ComposerModel):
 
 	def loss(self, outputs, batch):
 		"""Loss between unet output and added noise, typically mse."""
-		return self.loss_fn(outputs[0], outputs[1])
+		loss = self.loss_fn(outputs[0], outputs[1])
+		if loss.isnan().any() or loss.mean() > 2.0:
+			print(f"WARNING: Loss is NaN or too high: {loss.mean()}. Outputs: {outputs[0].mean()}, Targets: {outputs[1].mean()}")
+			for i in range(1000):
+				path = f"debug_explosion_{i}.pt"
+				if not Path(path).exists():
+					torch.save({
+						"outputs": outputs[0],
+						"targets": outputs[1],
+						"batch": batch,
+						"loss": loss,
+					}, path)
+					print(f"Saved debug data to {path}")
+					break
+		return loss
 
 	def eval_forward(self, batch, outputs=None):
 		"""For stable diffusion, eval forward computes unet outputs as well as some samples."""
@@ -433,16 +536,40 @@ class StableDiffusion(ComposerModel):
 		metric.update(outputs[0], outputs[1])
 
 
-def get_sigmas(noise_scheduler_copy, device, timesteps, n_dim=4, dtype=torch.float32):
-	sigmas = noise_scheduler_copy.sigmas.to(device=device, dtype=dtype)
-	schedule_timesteps = noise_scheduler_copy.timesteps.to(device)
-	timesteps = timesteps.to(device)
-	step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+# def get_sigmas(noise_scheduler_copy, device, timesteps, n_dim=4, dtype=torch.float32):
+# 	sigmas = noise_scheduler_copy.sigmas.to(device=device, dtype=dtype)
+# 	schedule_timesteps = noise_scheduler_copy.timesteps.to(device)
+# 	timesteps = timesteps.to(device)
+# 	step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
-	sigma = sigmas[step_indices].flatten()
-	while len(sigma.shape) < n_dim:
-		sigma = sigma.unsqueeze(-1)
-	return sigma
+# 	sigma = sigmas[step_indices].flatten()
+# 	while len(sigma.shape) < n_dim:
+# 		sigma = sigma.unsqueeze(-1)
+
+# 	return sigma
+
+def get_sigmas(
+	noise_scheduler,
+	device,
+	timesteps: torch.Tensor,
+	n_dim: int = 4,
+	dtype: torch.dtype = torch.float32,
+):
+	sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype, non_blocking=True)
+	sched_ts = noise_scheduler.timesteps.to(device, non_blocking=True)
+
+	# 2. Vectorised lookup ----------------------------------------------------
+	# sched_ts is descending; flip to ascending so we can use searchsorted,
+	# then map the indices back to the original order.
+	asc_ts = torch.flip(sched_ts, dims=(0,))            # ascending copy
+	idx = torch.searchsorted(asc_ts, timesteps.to(device))
+	idx = (len(sched_ts) - 1) - idx                     # restore descending offset
+
+	sigma = sigmas.index_select(0, idx)
+
+	# 3. Append as many trailing singleton dims as needed in one shot.
+	extra = (1,) * max(n_dim - sigma.ndim, 0)
+	return sigma.reshape(*sigma.shape, *extra)
 
 
 class StreamingImageCaptionDataset(StreamingDataset):
@@ -450,17 +577,14 @@ class StreamingImageCaptionDataset(StreamingDataset):
 		self,
 		tokenizer: PreTrainedTokenizer,
 		tokenizer_2: PreTrainedTokenizer,
-		streams: Sequence[Stream],
+		streams: Sequence[tuple[str, str]],
 		tag_prob: float,
+		streaming_config: StreamingConfig,
 		**streaming_kwargs,
 	) -> None:
-		# Set defaults for vision-friendly streaming args.
-		streaming_kwargs.setdefault('shuffle_block_size', 1 << 18)
-		streaming_kwargs.setdefault('shuffle_algo', 'py1s')
-
 		super().__init__(
-			streams=streams,
-			validate_hash='xxh3_128',
+			remotes_and_locals=streams,
+			config=streaming_config,
 			**streaming_kwargs,
 		)
 
@@ -470,19 +594,19 @@ class StreamingImageCaptionDataset(StreamingDataset):
 		self.token_counts = {}
 
 	def __getitem__(self, index):
-		sample = super().__getitem__(index)
+		sample = self.get_sample(index)
 		filehash: bytes = sample['filehash']
 		tag_string: str = sample['tag_string']
 		caption: str = sample['caption']
-		score: int = sample['score']
+		score: int = int(sample['score'])
 		latent_bytes: bytes = sample['latent']
-		n_chunks: int = sample['n_chunks']
-		latent_width: int = sample['latent_width']
-		latent_height: int = sample['latent_height']
-		original_width: int = sample['original_width']
-		original_height: int = sample['original_height']
-		crop_x: int = sample['crop_x']
-		crop_y: int = sample['crop_y']
+		n_chunks: int = int(sample['n_chunks'])
+		latent_width: int = int(sample['latent_width'])
+		latent_height: int = int(sample['latent_height'])
+		original_width: int = int(sample['original_width'])
+		original_height: int = int(sample['original_height'])
+		crop_x: int = int(sample['crop_x'])
+		crop_y: int = int(sample['crop_y'])
 
 		# Load the latent
 		assert len(latent_bytes) == 4 * 4 * latent_width * latent_height, f"Expected {latent_width}x{latent_height}x4x4 bytes, got {len(latent_bytes)}, for {filehash.hex()}"
@@ -500,7 +624,6 @@ class StreamingImageCaptionDataset(StreamingDataset):
 				prompt = ""
 			else:
 				prompt = score_to_quality_string(score)
-		
 
 		# Tokenize the prompt
 		tokens = self.tokenizer.encode(prompt, padding=False, truncation=False, add_special_tokens=False, verbose=False)
@@ -623,15 +746,18 @@ def score_to_quality_string(score: int) -> str:
 		return "masterpiece quality"
 
 
-def build_streams(remote: str, split: str, local: str) -> list[Stream]:
+def build_streams(remote: str, split: str, local: str) -> list[tuple[str, str]]:
 	"""
 	Builds a list of streams from a remote directory by iterating all subdirectories.
 	Args:
 		remote (str): The remote directory where the dataset is stored.
 		split (str): The split of the dataset, e.g. 'train', 'val', 'test'.
 		local (Path): The local directory where the dataset will be cached.
+	Returns:
+		list[tuple[str, str]]: A list of tuples where each tuple contains the remote URL of the stream and the local path.
 	"""
 	local_path = Path(local) / split
+	streams: list[tuple[str, str]] = []
 
 	if remote.startswith("s3://"):
 		if not remote.endswith('/'):
@@ -642,16 +768,13 @@ def build_streams(remote: str, split: str, local: str) -> list[Stream]:
 		remote_path = Path(remote) / split
 		if not remote_path.exists():
 			raise ValueError(f"Remote path {remote_path} does not exist. Please check the remote directory.")
-		stream_paths = [str(path) for path in remote_path.iterdir() if path.is_dir()]
+		stream_paths = [f"file://{path.absolute()}" for path in remote_path.iterdir() if path.is_dir()]
 	
-	streams: list[Stream] = []
-
 	for stream_path in stream_paths:
 		stream_name = stream_path.split('/')[-1] if not stream_path.endswith('/') else stream_path.split('/')[-2]
 		print(f"Building stream for {stream_path} in split {split}, caching to {local_path} as {stream_name}")
 
-		#stream = Stream(remote=stream_path, local=str(local_path / stream_name), download_retry=7, download_timeout=60, validate_hash="xxh3_128")
-		stream = Stream(remote=stream_path, local=str(local_path / stream_name), validate_hash="xxh3_128")
+		stream = (stream_path, str(local_path / stream_name))
 		streams.append(stream)
 	
 	return streams
@@ -725,21 +848,21 @@ class CustomStreamingDataLoader(StreamingDataLoader):
 		super().__init__(**kwargs)
 		self.device_batch_size = device_batch_size
 	
-	def __len__(self):
-		"""
-		Returns the number of device batches.
-		This is the total number of microbatches divided by the device batch size.
-		"""
-		micro_batch_size = self.dataset.batch_size # type: ignore
-		micro_batches_per_device_batch = self.device_batch_size // micro_batch_size
-		num_micro_batches = super().__len__()
-		num_device_batches = num_micro_batches // micro_batches_per_device_batch
-		remaining = num_micro_batches % micro_batches_per_device_batch
-		#print(f"DEBUG: DataLoader::__len__ -> {micro_batch_size=}, {micro_batches_per_device_batch=}, {num_micro_batches=}, {num_device_batches=}, {remaining=}")
-		if self.drop_last or remaining == 0:
-			return num_device_batches
-		else:
-			return num_device_batches + 1
+	# def __len__(self):
+	# 	"""
+	# 	Returns the number of device batches.
+	# 	This is the total number of microbatches divided by the device batch size.
+	# 	"""
+	# 	micro_batch_size = self.dataset.batch_size # type: ignore
+	# 	micro_batches_per_device_batch = self.device_batch_size // micro_batch_size
+	# 	num_micro_batches = super().__len__()
+	# 	num_device_batches = num_micro_batches // micro_batches_per_device_batch
+	# 	remaining = num_micro_batches % micro_batches_per_device_batch
+	# 	#print(f"DEBUG: DataLoader::__len__ -> {micro_batch_size=}, {micro_batches_per_device_batch=}, {num_micro_batches=}, {num_device_batches=}, {remaining=}")
+	# 	if self.drop_last or remaining == 0:
+	# 		return num_device_batches
+	# 	else:
+	# 		return num_device_batches + 1
 	
 	def __iter__(self):
 		current_batch = []
@@ -747,41 +870,67 @@ class CustomStreamingDataLoader(StreamingDataLoader):
 
 		for batch in super().__iter__():
 			current_batch.append(batch)
-			current_batch_size += self._get_batch_size(batch)
+			current_batch_size += self.get_num_samples_in_batch(batch)
 
 			if current_batch_size > self.device_batch_size:
-				raise ValueError(f"Device batch size ({self.device_batch_size}) must be evenly divisible by the microbatch size ({self._get_batch_size(batch)}).")
+				raise ValueError(f"Device batch size ({self.device_batch_size}) must be evenly divisible by the microbatch size ({self.get_num_samples_in_batch(batch)}).")
 
 			if current_batch_size == self.device_batch_size:
-				yield current_batch
+				yield BatchOfMicrobatches(current_batch)
 				current_batch = []
 				current_batch_size = 0
 		
 		if len(current_batch) > 0 and not self.drop_last:
-			yield current_batch
+			yield BatchOfMicrobatches(current_batch)
 		elif len(current_batch) > 0 and self.drop_last:
 			print(f"Dropping last batch of size {current_batch_size} with {len(current_batch)} microbatches, since drop_last is set to True.")
 
 	@staticmethod
 	def split_batch(batch: Any, microbatch_size: int | float) -> Sequence:
+		assert isinstance(batch, BatchOfMicrobatches), f"Expected batch to be a BatchOfMicrobatches, got {type(batch)}"
 		# The batch is already a list of microbatches, so we just return it as is.
-		return batch
+		return batch.microbatches
+	
+	# @staticmethod
+	# def get_num_samples_in_batch(batch: Any) -> int:
+	# 	# This method could be more generic, but it's good enough for us.
+	# 	# Handles: list[dict[str, torch.Tensor]] and dict[str, torch.Tensor]
+	# 	if isinstance(batch, dict):
+	# 		assert len(batch) > 0, "Batch must not be empty"
+	# 		x = next(iter(batch.values()))
+	# 		assert isinstance(x, torch.Tensor), f"Expected batch item to contain a tensor, got {type(x)}"
+	# 		assert x.ndim > 0, f"Expected batch item tensor to have at least one dimension, got {x.ndim}"
+	# 		return x.shape[0]
+	# 	elif isinstance(batch, list):
+	# 		assert len(batch) > 0, "Batch must not be empty"
+	# 		return sum(CustomStreamingDataLoader.get_num_samples_in_batch(b) for b in batch)
+	# 	else:
+	# 		raise ValueError(f"Expected batch to be a dict or a list, got {type(batch)}")
 	
 	@staticmethod
-	def get_num_samples_in_batch(batch: Any) -> int:
-		# This method could be more generic, but it's good enough for us.
-		# Handles: list[dict[str, torch.Tensor]] and dict[str, torch.Tensor]
-		if isinstance(batch, dict):
-			assert len(batch) > 0, "Batch must not be empty"
-			x = next(iter(batch.values()))
-			assert isinstance(x, torch.Tensor), f"Expected batch item to contain a tensor, got {type(x)}"
-			assert x.ndim > 0, f"Expected batch item tensor to have at least one dimension, got {x.ndim}"
-			return x.shape[0]
-		elif isinstance(batch, list):
-			assert len(batch) > 0, "Batch must not be empty"
-			return sum(CustomStreamingDataLoader.get_num_samples_in_batch(b) for b in batch)
-		else:
-			raise ValueError(f"Expected batch to be a dict or a list, got {type(batch)}")
+	def get_num_samples_in_batch(batch) -> int:
+		"""
+		Figure out how many *individual* samples are in `batch`.
+		Handles common collate outputs (tensor, mapping, sequence).
+		"""
+		if isinstance(batch, BatchOfMicrobatches):
+			return sum(StreamingDataLoader._infer_batch_size(mb) for mb in batch.microbatches)
+		
+		if torch.is_tensor(batch):
+			return batch.size(0)
+		
+		if isinstance(batch, Mapping):
+			return StreamingDataLoader._infer_batch_size(next(iter(batch.values())))
+		
+		if isinstance(batch, Sequence):
+			return len(batch)
+		
+		raise  TypeError(f"Cannot infer batch size of type {type(batch)}")
+
+
+class BatchOfMicrobatches:
+	def __init__(self, microbatches: Sequence):
+		self.microbatches = microbatches
 
 
 class StreamingWarningFilter(logging.Filter):
