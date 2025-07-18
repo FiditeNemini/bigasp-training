@@ -1,0 +1,112 @@
+project: big-asp-2_5
+run_id: test_215
+seed: 17
+eval_first: true
+algorithms:
+  gradient_clipping:
+    _target_: composer.algorithms.GradientClipping
+    clipping_type: norm
+    clipping_threshold: 1.0
+model:
+  base_model: stabilityai/stable-diffusion-xl-base-1.0
+  base_revision: 462165984030d82259a11f4367a4eed129e94a7b
+  base_variant: fp16
+  fsdp: true
+  train_text_encoder: false #true
+  gradient_checkpointing: true
+dataset:
+  train_batch_size: 4096
+  test_batch_size: 1024
+  eval_batch_size: 2048
+  remote: s3://big-asp-v2-5-streams/
+  local: cache/ #/mnt/filesystem-e8  #/experiments/data/streaming-cache
+  cache_dir: /mnt/filesystem-e8 #test-cache #/mnt/filesystem-e8
+  cache_limit: 0 #100000000000 # 100GB
+  max_downloads: 64
+  readahead: 128    # At a rate of about 9.6 samples/sec/gpu, and 16 workers, this gives about 3.5 minutes of readahead
+  num_cache_workers: 8
+  tag_prob: 0.2   # Probability of using tagstring instead of caption
+  train_dataset:
+    dataloader_kwargs:
+      drop_last: true
+      num_workers: 16
+      persistent_workers: true
+      pin_memory: true
+      prefetch_factor: 2
+    streaming_kwargs:
+      seed: ${seed}
+      shuffle: true
+      drop_last: true
+  test_dataset:
+    dataloader_kwargs:
+      drop_last: false
+      num_workers: 8
+      persistent_workers: true
+      pin_memory: true
+      prefetch_factor: 2
+    streaming_kwargs:
+      seed: ${seed}
+      shuffle: false
+      drop_last: false
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 0.0001
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  te_lr_rate: 0.1
+  #fused: true
+scheduler:
+  _target_: composer.optim.CosineAnnealingWithWarmupScheduler
+  t_warmup: 1000000sp
+  alpha_f: 0.0
+  t_max: 1dur
+logger:
+  wandb:
+    _target_: composer.loggers.wandb_logger.WandBLogger
+    project: ${project}
+    #name: ${name}
+  file:
+    _target_: composer.loggers.file_logger.FileLogger
+    filename: "logs/{run_name}/logs-rank{rank}.txt"
+  #  remote_file_name: "logs/{run_name}/logs-rank{rank}.txt"
+    flush_interval: 50
+  #remote:
+  #  _target_: composer.loggers.RemoteUploaderDownloader
+  #  bucket_uri: "s3://big-asp-v2-5-checkpoints"
+callbacks:
+  speed_monitor:
+    _target_: composer.callbacks.speed_monitor.SpeedMonitor
+    window_size: 10
+  lr_monitor:
+    _target_: composer.callbacks.lr_monitor.LRMonitor
+  memory_monitor:
+    _target_: composer.callbacks.memory_monitor.MemoryMonitor
+  runtime_estimator:
+    _target_: composer.callbacks.runtime_estimator.RuntimeEstimator
+  optimizer_monitor:
+    _target_: composer.callbacks.OptimizerMonitor
+  grad_scaler_monitor:
+    _target_: __main__.GradScalerMonitor
+trainer:
+  _target_: composer.Trainer
+  device: gpu
+  max_duration: 150000000sp
+  eval_interval: 500000sp
+  device_train_microbatch_size: 16
+  seed: ${seed}
+  #run_name: ${name}
+  save_folder: checkpoints/{run_name}  #"s3://big-asp-v2-5-checkpoints/checkpoints/{run_name}/" #"s3://big-asp-v2-5-checkpoints/checkpoints/{run_name}/" # checkpoints/{run_name}
+  #save_filename: "checkpoints/ep{epoch}-ba{batch}-rank{rank}.pt"
+  save_interval: 1000000sp
+  save_overwrite: false
+  autoresume: true
+  precision: amp_bf16  #amp_bf16
+  parallelism_config:
+    fsdp:
+      sharding_strategy: "SHARD_GRAD_OP" # "NO_SHARD"
+      use_orig_params: true
+  #compile_config:
+  #  mode: reduce-overhead
+  #  fullgraph: true
